@@ -1,6 +1,6 @@
 #!/bin/bash
 # Global SessionStart Hook: Validate CAM and load recent context
-# Version: 1.7.0 (Phase 6 - Added session state + primer management)
+# Version: 2.0.0
 
 set -e
 

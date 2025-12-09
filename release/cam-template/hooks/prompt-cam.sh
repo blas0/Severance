@@ -2,7 +2,7 @@
 # Global UserPromptSubmit Hook: Query CAM before Claude processes user message
 # This is the "before_user_message" hook from the CAM vision
 # Purpose: Provide proactive, intent-based context BEFORE Claude starts processing
-# Version: 1.7.0 (Phase 6 - Added primer detection for post-compact recovery)
+# Version: 2.0.0
 
 set -e
 

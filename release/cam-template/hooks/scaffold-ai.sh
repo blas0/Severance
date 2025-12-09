@@ -1,6 +1,7 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════
 # scaffold-ai.sh - Auto-scaffold .ai/ documentation framework
+# Version: 2.0.0
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # PURPOSE: Create standardized .ai/ documentation structure in any project

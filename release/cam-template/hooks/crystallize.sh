@@ -1,7 +1,7 @@
 #!/bin/bash
 # ~/.claude/hooks/crystallize.sh
 # PreCompact Hook: Crystallize session knowledge before context compression
-# Version: 1.7.0 (Phase 6)
+# Version: 2.0.0
 #
 # Fires: Before any compaction (manual /compact or auto-compact)
 # Purpose: Preserve session context by summarizing to CAM and primer file

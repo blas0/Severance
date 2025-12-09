@@ -1,6 +1,6 @@
 #!/bin/bash
 # CAM Cache Cleanup - Remove expired cache entries (30 min TTL)
-# This script can be run manually or via cron job for periodic cleanup
+# Version: 2.0.0
 # Usage: cam-cache-clean.sh [optional: clean all]
 
 set -e

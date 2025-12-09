@@ -23,7 +23,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import cosine as cosine_distance
 
 # Version
-CAM_VERSION = "1.7.2"
+CAM_VERSION = "2.0.0"
 
 # Configuration
 CAM_DIR = os.path.join(os.path.dirname(__file__))
@@ -1453,6 +1453,1374 @@ Original Prompt:
             "embedded_count": embedded_count,
             "total_annotations": total_annotations,
             "total_relationships": total_relationships,
+        }
+
+    # =========================================================================
+    # PHASE 1: IMPORTANCE-WEIGHTED QUERY METHODS (v1.8.0)
+    # =========================================================================
+
+    def query_with_importance(
+        self, text: str, top_k: int = 5, min_tier: str = 'normal'
+    ) -> list:
+        """
+        Query embeddings with importance tier filtering and weighting
+
+        Args:
+            text: Search query
+            top_k: Number of results to return
+            min_tier: Minimum importance tier ('critical'|'high'|'normal'|'reference')
+
+        Returns:
+            List of embeddings with scores boosted by importance tier
+        """
+        tier_multipliers = {
+            'critical': 4.0,
+            'high': 2.0,
+            'normal': 1.0,
+            'reference': 0.5
+        }
+
+        # Get baseline semantic results
+        results = self.query(text, top_k * 2)  # Get extra to filter
+
+        # Filter by minimum importance tier
+        tier_order = {'critical': 4, 'high': 3, 'normal': 2, 'reference': 1}
+        min_tier_level = tier_order.get(min_tier, 2)
+
+        # Fetch importance tiers for results
+        cursor = self.vectors_conn.cursor()
+        filtered_results = []
+        for emb_id, content, score in results:
+            cursor.execute(
+                "SELECT importance_tier FROM embeddings WHERE id = ?",
+                (emb_id,)
+            )
+            row = cursor.fetchone()
+            result_tier = row[0] if row and row[0] else 'normal'
+            result_tier_level = tier_order.get(result_tier, 2)
+
+            if result_tier_level >= min_tier_level:
+                multiplier = tier_multipliers.get(result_tier, 1.0)
+                filtered_results.append({
+                    'id': emb_id,
+                    'content': content,
+                    'score': score * multiplier,
+                    'importance_tier': result_tier,
+                    'importance_multiplier': multiplier
+                })
+
+        # Sort by weighted score and return top_k
+        sorted_results = sorted(
+            filtered_results,
+            key=lambda x: x['score'],
+            reverse=True
+        )
+        return sorted_results[:top_k]
+
+    def set_importance_tier(self, embedding_id: str, tier: str) -> bool:
+        """
+        Set importance tier for an embedding
+
+        Args:
+            embedding_id: ID of the embedding
+            tier: 'critical'|'high'|'normal'|'reference'
+
+        Returns:
+            True if successful
+        """
+        if tier not in ('critical', 'high', 'normal', 'reference'):
+            self._log(f"Invalid importance tier: {tier}")
+            return False
+
+        try:
+            cursor = self.vectors_conn.cursor()
+            cursor.execute(
+                "UPDATE embeddings SET importance_tier = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (tier, embedding_id)
+            )
+            self.vectors_conn.commit()
+            self._log(f"Set importance tier for {embedding_id[:8]} to {tier}")
+            return True
+        except Exception as e:
+            self._log(f"Error setting importance tier: {e}")
+            return False
+
+    def get_important_results(self, tier: str = 'critical', limit: int = 10) -> list:
+        """
+        Get all embeddings of a specific importance tier
+
+        Args:
+            tier: 'critical'|'high'|'normal'|'reference'
+            limit: Maximum results to return
+
+        Returns:
+            List of embeddings with matching tier
+        """
+        try:
+            cursor = self.vectors_conn.cursor()
+            cursor.execute(
+                "SELECT id, content, source_type, importance_tier, created_at FROM embeddings "
+                "WHERE importance_tier = ? ORDER BY created_at DESC LIMIT ?",
+                (tier, limit)
+            )
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row[0],
+                    'content': row[1],
+                    'source_type': row[2],
+                    'importance_tier': row[3],
+                    'created_at': row[4]
+                })
+            return results
+        except Exception as e:
+            self._log(f"Error retrieving important results: {e}")
+            return []
+
+    # =========================================================================
+    # PHASE 1: DECISION STORAGE METHODS (v1.8.0)
+    # =========================================================================
+
+    def store_decision(
+        self, title: str, rationale: str,
+        alternatives: list = None, constraints: list = None,
+        importance_tier: str = 'normal', decision_type: str = None,
+        embedding_id: str = None
+    ) -> str:
+        """
+        Store architectural decision with full context
+
+        Args:
+            title: Decision title ("Why we chose PostgreSQL")
+            rationale: Multi-paragraph explanation of the decision
+            alternatives: List of alternatives considered ["MongoDB", "DynamoDB"]
+            constraints: List of constraints applied ["write-heavy", "ACID-required"]
+            importance_tier: 'critical'|'high'|'normal'|'reference'
+            decision_type: 'architecture'|'technical'|'process'
+            embedding_id: Link to source embedding if from session
+
+        Returns:
+            Decision ID (16-char hash)
+        """
+        decision_id = self._generate_id(title + rationale)
+
+        try:
+            cursor = self.metadata_conn.cursor()
+            cursor.execute("""
+                INSERT INTO decisions (
+                    id, embedding_id, title, rationale,
+                    alternatives_considered, constraints_applied,
+                    importance_tier, decision_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                decision_id,
+                embedding_id,
+                title,
+                rationale,
+                json.dumps(alternatives or []),
+                json.dumps(constraints or []),
+                importance_tier,
+                decision_type
+            ))
+            self.metadata_conn.commit()
+            self._log(f"Stored decision: {title[:50]}... (tier: {importance_tier})")
+            return decision_id
+        except Exception as e:
+            self._log(f"Error storing decision: {e}")
+            return None
+
+    def retrieve_decision(self, decision_id: str) -> dict:
+        """
+        Retrieve decision with full context
+
+        Args:
+            decision_id: The decision ID to retrieve
+
+        Returns:
+            Decision dict with all fields
+        """
+        try:
+            cursor = self.metadata_conn.cursor()
+            cursor.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,))
+            row = cursor.fetchone()
+
+            if not row:
+                return None
+
+            return {
+                'id': row[0],
+                'embedding_id': row[1],
+                'title': row[2],
+                'rationale': row[3],
+                'alternatives_considered': json.loads(row[4] or '[]'),
+                'constraints_applied': json.loads(row[5] or '[]'),
+                'importance_tier': row[6],
+                'decision_type': row[7],
+                'created_at': row[8],
+                'updated_at': row[9]
+            }
+        except Exception as e:
+            self._log(f"Error retrieving decision: {e}")
+            return None
+
+    def get_decisions_by_tier(self, tier: str = 'critical', limit: int = 20) -> list:
+        """
+        Get all decisions of a specific importance tier
+
+        Args:
+            tier: 'critical'|'high'|'normal'|'reference'
+            limit: Maximum decisions to return
+
+        Returns:
+            List of decisions sorted by recency
+        """
+        try:
+            cursor = self.metadata_conn.cursor()
+            cursor.execute("""
+                SELECT id, title, rationale, importance_tier, created_at
+                FROM decisions WHERE importance_tier = ?
+                ORDER BY created_at DESC LIMIT ?
+            """, (tier, limit))
+
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row[0],
+                    'title': row[1],
+                    'rationale': row[2],
+                    'importance_tier': row[3],
+                    'created_at': row[4]
+                })
+            return results
+        except Exception as e:
+            self._log(f"Error retrieving decisions: {e}")
+            return []
+
+    def get_recent_decisions(self, limit: int = 5) -> list:
+        """Get most recent decisions regardless of tier"""
+        try:
+            cursor = self.metadata_conn.cursor()
+            cursor.execute("""
+                SELECT id, title, importance_tier, created_at
+                FROM decisions ORDER BY created_at DESC LIMIT ?
+            """, (limit,))
+
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row[0],
+                    'title': row[1],
+                    'importance_tier': row[2],
+                    'created_at': row[3]
+                })
+            return results
+        except Exception as e:
+            self._log(f"Error retrieving recent decisions: {e}")
+            return []
+
+    # =========================================================================
+    # PHASE 1: INVARIANT MANAGEMENT METHODS (v1.8.0)
+    # =========================================================================
+
+    def store_invariant(
+        self, category: str, statement: str,
+        rationale: str = None, enforcement: str = 'required',
+        validation_method: str = None, exceptions: list = None
+    ) -> str:
+        """
+        Store architectural invariant (constraint that must be maintained)
+
+        Args:
+            category: 'security'|'performance'|'architecture'|'business'
+            statement: The invariant statement ("All external APIs must cache for 5+ minutes")
+            rationale: Why this invariant exists
+            enforcement: 'required'|'preferred'|'guideline'
+            validation_method: 'lint_rule'|'code_review'|'test'
+            exceptions: List of exception scenarios
+
+        Returns:
+            Invariant ID
+        """
+        invariant_id = self._generate_id(category + statement)
+
+        try:
+            cursor = self.metadata_conn.cursor()
+            cursor.execute("""
+                INSERT INTO invariants (
+                    id, category, statement, rationale,
+                    enforcement, validation_method, exceptions
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                invariant_id,
+                category,
+                statement,
+                rationale,
+                enforcement,
+                validation_method,
+                json.dumps(exceptions or [])
+            ))
+            self.metadata_conn.commit()
+            self._log(f"Stored invariant: {statement[:50]}... (enforcement: {enforcement})")
+            return invariant_id
+        except Exception as e:
+            self._log(f"Error storing invariant: {e}")
+            return None
+
+    def get_invariants_by_category(self, category: str) -> list:
+        """
+        Get all invariants in a specific category
+
+        Args:
+            category: 'security'|'performance'|'architecture'|'business'
+
+        Returns:
+            List of invariants
+        """
+        try:
+            cursor = self.metadata_conn.cursor()
+            cursor.execute("""
+                SELECT id, statement, enforcement, validation_method FROM invariants
+                WHERE category = ? ORDER BY enforcement DESC
+            """, (category,))
+
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row[0],
+                    'statement': row[1],
+                    'enforcement': row[2],
+                    'validation_method': row[3]
+                })
+            return results
+        except Exception as e:
+            self._log(f"Error retrieving invariants: {e}")
+            return []
+
+    def get_relevant_invariants(self, task_intent: str = None) -> list:
+        """
+        Get invariants relevant to current task (all REQUIRED invariants by default)
+
+        Args:
+            task_intent: Optional task description to filter invariants
+
+        Returns:
+            List of applicable invariants
+        """
+        try:
+            cursor = self.metadata_conn.cursor()
+
+            if task_intent:
+                # For now, return all REQUIRED invariants
+                # Future: Use semantic similarity to task_intent
+                cursor.execute("""
+                    SELECT id, category, statement, enforcement FROM invariants
+                    WHERE enforcement = 'required' ORDER BY category
+                """)
+            else:
+                cursor.execute("""
+                    SELECT id, category, statement, enforcement FROM invariants
+                    WHERE enforcement = 'required' ORDER BY category
+                """)
+
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    'id': row[0],
+                    'category': row[1],
+                    'statement': row[2],
+                    'enforcement': row[3]
+                })
+            return results
+        except Exception as e:
+            self._log(f"Error retrieving relevant invariants: {e}")
+            return []
+
+    # =========================================================================
+    # PHASE 1: CAUSAL RELATIONSHIP TRACKING METHODS (v1.8.0)
+    # =========================================================================
+
+    def create_causal_relationship(
+        self, source_id: str, target_id: str,
+        causal_reason: str = None, relationship_type: str = 'causal'
+    ) -> bool:
+        """
+        Create causal link between embeddings (bug → root cause → fix → why)
+
+        Args:
+            source_id: Source embedding ID
+            target_id: Target embedding ID
+            causal_reason: Explanation of the causal relationship
+            relationship_type: Type of relationship (defaults to 'causal')
+
+        Returns:
+            True if successful
+        """
+        try:
+            cursor = self.graph_conn.cursor()
+
+            metadata = {}
+            if causal_reason:
+                metadata['reason'] = causal_reason
+
+            cursor.execute("""
+                INSERT OR REPLACE INTO relationships (
+                    source_id, target_id, relationship_type, weight, metadata
+                ) VALUES (?, ?, ?, ?, ?)
+            """, (
+                source_id,
+                target_id,
+                relationship_type,
+                1.0,
+                json.dumps(metadata)
+            ))
+            self.graph_conn.commit()
+            self._log(f"Created {relationship_type} relationship: {source_id[:8]} → {target_id[:8]}")
+            return True
+        except Exception as e:
+            self._log(f"Error creating causal relationship: {e}")
+            return False
+
+    def trace_causality(self, embedding_id: str, max_depth: int = 5) -> dict:
+        """
+        Trace causal chain: bug → root cause → fix → why
+
+        Args:
+            embedding_id: Starting embedding ID
+            max_depth: Maximum depth to traverse
+
+        Returns:
+            Dict with causal chain structure
+        """
+        def traverse(eid, depth=0, visited=None):
+            if visited is None:
+                visited = set()
+            if depth > max_depth or eid in visited:
+                return None
+
+            visited.add(eid)
+
+            try:
+                cursor = self.graph_conn.cursor()
+                cursor.execute("""
+                    SELECT target_id, relationship_type, metadata FROM relationships
+                    WHERE source_id = ? AND relationship_type = 'causal'
+                """, (eid,))
+
+                chain = {'id': eid, 'children': []}
+                for row in cursor.fetchall():
+                    target_id, rel_type, metadata = row
+                    metadata = json.loads(metadata or '{}')
+                    child = traverse(target_id, depth + 1, visited)
+                    if child:
+                        chain['children'].append({
+                            'id': target_id,
+                            'reason': metadata.get('reason'),
+                            'chain': child
+                        })
+
+                return chain if chain['children'] or depth == 0 else None
+
+            except Exception as e:
+                self._log(f"Error tracing causality: {e}")
+                return None
+
+        chain = traverse(embedding_id)
+        return {
+            'source_id': embedding_id,
+            'causal_chain': chain,
+            'depth': len(self._count_chain_depth(chain)) if chain else 0
+        }
+
+    def _count_chain_depth(self, chain) -> list:
+        """Helper to count chain depth"""
+        if not chain or not chain.get('children'):
+            return [chain['id']] if chain else []
+        depth = [chain['id']]
+        for child in chain['children']:
+            depth.extend(self._count_chain_depth(child.get('chain')))
+        return depth
+
+    def get_causal_related(self, embedding_id: str) -> list:
+        """
+        Get all embeddings causally related to this one
+
+        Args:
+            embedding_id: The embedding to find relations for
+
+        Returns:
+            List of related embeddings with relationship type
+        """
+        try:
+            cursor = self.graph_conn.cursor()
+
+            # Get outgoing causal relationships
+            cursor.execute("""
+                SELECT target_id, relationship_type FROM relationships
+                WHERE source_id = ? AND relationship_type IN ('causal', 'temporal', 'semantic')
+            """, (embedding_id,))
+
+            results = []
+            for row in cursor.fetchall():
+                target_id, rel_type = row
+                # Fetch the target embedding
+                target_embedding = self.get_embedding(target_id)
+                if target_embedding:
+                    results.append({
+                        'id': target_id,
+                        'relationship': rel_type,
+                        'content': target_embedding.get('content', '')[:100]
+                    })
+
+            return results
+        except Exception as e:
+            self._log(f"Error getting causal related: {e}")
+            return []
+
+    # =========================================================================
+    # PHASE 3: QUERY DSL METHODS (v2.0.0)
+    # TOML-based query language with constraints and graph traversal
+    # =========================================================================
+
+    def parse_query_dsl(self, dsl_string: str) -> dict:
+        """
+        Parse a TOML-based Query DSL string into a structured query object.
+
+        DSL Format:
+        ```toml
+        [query]
+        text = "search terms"
+        min_tier = "high"      # optional: critical|high|normal|reference
+        top_k = 10             # optional: default 5
+
+        [constraints]
+        type = "code"          # optional: code|docs|operation|external
+        category = "security"  # optional: for invariants
+        tags = ["auth", "api"] # optional: filter by tags
+
+        [graph]
+        traverse = true        # optional: enable graph traversal
+        max_depth = 3          # optional: traversal depth
+        relationship_types = ["causal", "semantic"]  # optional
+        ```
+
+        Returns dict with parsed query parameters.
+        """
+        try:
+            import tomllib  # Python 3.11+
+        except ImportError:
+            try:
+                import tomli as tomllib  # Fallback for older Python
+            except ImportError:
+                # Manual parsing fallback
+                return self._parse_query_dsl_manual(dsl_string)
+
+        try:
+            parsed = tomllib.loads(dsl_string)
+            return {
+                'query': parsed.get('query', {}),
+                'constraints': parsed.get('constraints', {}),
+                'graph': parsed.get('graph', {})
+            }
+        except Exception as e:
+            self._log(f"Error parsing Query DSL: {e}")
+            return {'query': {'text': dsl_string}, 'constraints': {}, 'graph': {}}
+
+    def _parse_query_dsl_manual(self, dsl_string: str) -> dict:
+        """Manual TOML-like parser for environments without tomllib."""
+        result = {'query': {}, 'constraints': {}, 'graph': {}}
+        current_section = 'query'
+
+        for line in dsl_string.strip().split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            # Section header
+            if line.startswith('[') and line.endswith(']'):
+                section = line[1:-1].strip()
+                if section in result:
+                    current_section = section
+                continue
+
+            # Key-value pair
+            if '=' in line:
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+
+                # Parse value type
+                if value.startswith('"') and value.endswith('"'):
+                    value = value[1:-1]
+                elif value.startswith('[') and value.endswith(']'):
+                    # Parse array
+                    value = [v.strip().strip('"') for v in value[1:-1].split(',') if v.strip()]
+                elif value.lower() == 'true':
+                    value = True
+                elif value.lower() == 'false':
+                    value = False
+                elif value.isdigit():
+                    value = int(value)
+
+                result[current_section][key] = value
+
+        return result
+
+    def query_dsl(self, dsl_input: str) -> list:
+        """
+        Execute a Query DSL query with full constraint and graph support.
+
+        Args:
+            dsl_input: TOML-formatted query DSL string
+
+        Returns:
+            List of matching embeddings with scores and graph context
+        """
+        # Parse DSL
+        parsed = self.parse_query_dsl(dsl_input)
+        query_params = parsed.get('query', {})
+        constraints = parsed.get('constraints', {})
+        graph_params = parsed.get('graph', {})
+
+        # Extract query parameters
+        text = query_params.get('text', '')
+        min_tier = query_params.get('min_tier', 'normal')
+        top_k = query_params.get('top_k', 5)
+
+        if not text:
+            return []
+
+        # Phase 1: Semantic search with importance weighting
+        results = self.query_with_importance(text, top_k=top_k * 2, min_tier=min_tier)
+
+        # Phase 2: Apply constraints
+        filtered_results = self._apply_constraints(results, constraints)
+
+        # Phase 3: Graph traversal (if enabled)
+        if graph_params.get('traverse', False):
+            filtered_results = self._apply_graph_traversal(
+                filtered_results,
+                max_depth=graph_params.get('max_depth', 2),
+                relationship_types=graph_params.get('relationship_types', ['causal', 'semantic'])
+            )
+
+        # Return top_k results
+        return filtered_results[:top_k]
+
+    def _apply_constraints(self, results: list, constraints: dict) -> list:
+        """Apply constraint filters to query results."""
+        if not constraints:
+            return results
+
+        filtered = []
+
+        for result in results:
+            # Type constraint
+            if 'type' in constraints:
+                source_type = result.get('source_type', '')
+                if source_type != constraints['type']:
+                    continue
+
+            # Tags constraint
+            if 'tags' in constraints:
+                required_tags = constraints['tags']
+                if isinstance(required_tags, str):
+                    required_tags = [required_tags]
+                result_tags = result.get('tags', '').split(',')
+                if not any(tag.strip() in result_tags for tag in required_tags):
+                    continue
+
+            # Category constraint (for invariants/decisions)
+            if 'category' in constraints:
+                # Check if result metadata contains category
+                metadata = result.get('metadata', {})
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except:
+                        metadata = {}
+                if metadata.get('category') != constraints['category']:
+                    continue
+
+            # Date range constraint
+            if 'after' in constraints:
+                created = result.get('created_at', '')
+                if created and created < constraints['after']:
+                    continue
+
+            if 'before' in constraints:
+                created = result.get('created_at', '')
+                if created and created > constraints['before']:
+                    continue
+
+            filtered.append(result)
+
+        return filtered
+
+    def _apply_graph_traversal(
+        self, results: list, max_depth: int = 2,
+        relationship_types: list = None
+    ) -> list:
+        """
+        Enhance results with graph-connected context.
+
+        For each result, traverses the knowledge graph to find
+        related embeddings and adds them to the result set.
+        """
+        if relationship_types is None:
+            relationship_types = ['causal', 'semantic', 'temporal']
+
+        enhanced_results = list(results)
+        seen_ids = {r.get('id') for r in results if r.get('id')}
+
+        for result in results:
+            embedding_id = result.get('id')
+            if not embedding_id:
+                continue
+
+            # Traverse graph from this node
+            related = self._traverse_graph(
+                embedding_id,
+                max_depth=max_depth,
+                relationship_types=relationship_types,
+                seen=seen_ids
+            )
+
+            for rel_result in related:
+                rel_id = rel_result.get('id')
+                if rel_id and rel_id not in seen_ids:
+                    # Mark as graph-discovered
+                    rel_result['_graph_source'] = embedding_id
+                    rel_result['_graph_depth'] = rel_result.get('_depth', 1)
+                    enhanced_results.append(rel_result)
+                    seen_ids.add(rel_id)
+
+        return enhanced_results
+
+    def _traverse_graph(
+        self, start_id: str, max_depth: int = 2,
+        relationship_types: list = None, seen: set = None
+    ) -> list:
+        """Recursive graph traversal from a starting node."""
+        if seen is None:
+            seen = set()
+        if relationship_types is None:
+            relationship_types = ['causal', 'semantic', 'temporal']
+
+        if max_depth <= 0 or start_id in seen:
+            return []
+
+        seen.add(start_id)
+        results = []
+
+        try:
+            conn = sqlite3.connect(GRAPH_DB)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Get outgoing relationships
+            placeholders = ','.join(['?' for _ in relationship_types])
+            cursor.execute(f"""
+                SELECT target_id, relationship_type, weight
+                FROM relationships
+                WHERE source_id = ? AND relationship_type IN ({placeholders})
+                ORDER BY weight DESC
+                LIMIT 10
+            """, [start_id] + relationship_types)
+
+            for row in cursor.fetchall():
+                target_id = row['target_id']
+                if target_id in seen:
+                    continue
+
+                # Get target embedding
+                embedding = self.get_embedding_by_id(target_id)
+                if embedding:
+                    embedding['_relationship'] = row['relationship_type']
+                    embedding['_weight'] = row['weight']
+                    embedding['_depth'] = max_depth
+                    results.append(embedding)
+
+                    # Recurse
+                    if max_depth > 1:
+                        deeper = self._traverse_graph(
+                            target_id, max_depth - 1,
+                            relationship_types, seen
+                        )
+                        results.extend(deeper)
+
+            conn.close()
+        except Exception as e:
+            self._log(f"Graph traversal error: {e}")
+
+        return results
+
+    def get_embedding_by_id(self, embedding_id: str) -> dict:
+        """Retrieve a single embedding by ID."""
+        try:
+            conn = sqlite3.connect(VECTORS_DB)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT id, content, source_type, source_path, created_at,
+                       importance_tier
+                FROM embeddings
+                WHERE id = ?
+            """, (embedding_id,))
+
+            row = cursor.fetchone()
+            conn.close()
+
+            if row:
+                return dict(row)
+            return None
+        except Exception as e:
+            self._log(f"Error getting embedding by ID: {e}")
+            return None
+
+    def query_with_graph(
+        self, text: str, top_k: int = 5,
+        include_related: bool = True, max_depth: int = 2
+    ) -> list:
+        """
+        Convenience method: query with automatic graph expansion.
+
+        Combines semantic search with graph traversal in one call.
+        """
+        dsl = f'''
+[query]
+text = "{text}"
+top_k = {top_k}
+
+[graph]
+traverse = {str(include_related).lower()}
+max_depth = {max_depth}
+'''
+        return self.query_dsl(dsl)
+
+    def multi_hop_query(
+        self, questions: list, strategy: str = 'chain'
+    ) -> dict:
+        """
+        Execute multi-hop reasoning across multiple related queries.
+
+        Strategies:
+        - 'chain': Each query informs the next
+        - 'parallel': All queries run independently then merged
+        - 'tree': Branching queries with consolidation
+
+        Args:
+            questions: List of query strings
+            strategy: Reasoning strategy
+
+        Returns:
+            Dict with aggregated results and reasoning chain
+        """
+        if not questions:
+            return {'results': [], 'chain': []}
+
+        chain = []
+        all_results = []
+        context_ids = set()
+
+        if strategy == 'chain':
+            # Each query builds on previous results
+            for i, question in enumerate(questions):
+                # Build DSL with context from previous
+                if context_ids:
+                    # Boost results connected to previous findings
+                    results = self.query_with_importance(question, top_k=5)
+                    # Filter to prioritize graph-connected results
+                    connected = []
+                    other = []
+                    for r in results:
+                        rid = r.get('id')
+                        if rid and self._is_graph_connected(rid, context_ids):
+                            connected.append(r)
+                        else:
+                            other.append(r)
+                    results = connected + other
+                else:
+                    results = self.query_with_importance(question, top_k=5)
+
+                # Track for next hop
+                for r in results[:3]:
+                    if r.get('id'):
+                        context_ids.add(r['id'])
+
+                chain.append({
+                    'hop': i + 1,
+                    'question': question,
+                    'results_count': len(results),
+                    'top_result': results[0].get('content', '')[:100] if results else None
+                })
+                all_results.extend(results)
+
+        elif strategy == 'parallel':
+            # All queries independent
+            for i, question in enumerate(questions):
+                results = self.query_with_importance(question, top_k=5)
+                chain.append({
+                    'hop': i + 1,
+                    'question': question,
+                    'results_count': len(results)
+                })
+                all_results.extend(results)
+
+        # Deduplicate results
+        seen_ids = set()
+        unique_results = []
+        for r in all_results:
+            rid = r.get('id')
+            if rid and rid not in seen_ids:
+                seen_ids.add(rid)
+                unique_results.append(r)
+            elif not rid:
+                unique_results.append(r)
+
+        return {
+            'results': unique_results,
+            'chain': chain,
+            'strategy': strategy,
+            'total_hops': len(questions)
+        }
+
+    def _is_graph_connected(self, embedding_id: str, target_ids: set) -> bool:
+        """Check if embedding is connected to any target in the graph."""
+        try:
+            conn = sqlite3.connect(GRAPH_DB)
+            cursor = conn.cursor()
+
+            placeholders = ','.join(['?' for _ in target_ids])
+            cursor.execute(f"""
+                SELECT 1 FROM relationships
+                WHERE (source_id = ? AND target_id IN ({placeholders}))
+                   OR (target_id = ? AND source_id IN ({placeholders}))
+                LIMIT 1
+            """, [embedding_id] + list(target_ids) + [embedding_id] + list(target_ids))
+
+            result = cursor.fetchone() is not None
+            conn.close()
+            return result
+        except:
+            return False
+
+    # =========================================================================
+    # PHASE 4: CMR - CONTEXTUAL MEMORY REWEAVING (v2.1.0)
+    # Intelligent memory compression, preservation, and reconstruction
+    # Based on: CMR Paper (arxiv.org/html/2502.02046v1)
+    # =========================================================================
+
+    def detect_inflection_points(
+        self, session_id: str = None, threshold: float = 0.7
+    ) -> list:
+        """
+        Detect inflection points - significant moments in the session.
+
+        Inflection points are identified by:
+        1. Decision tier changes (normal -> critical)
+        2. High clustering of operations on same files
+        3. Causal chain starts
+        4. Invariant violations
+
+        Returns list of embeddings representing inflection points.
+        """
+        inflection_points = []
+
+        try:
+            # Get recent critical decisions as inflection points
+            critical_decisions = self.get_decisions_by_tier('critical', limit=10)
+            for decision in critical_decisions:
+                inflection_points.append({
+                    'type': 'critical_decision',
+                    'id': decision.get('id'),
+                    'title': decision.get('title'),
+                    'created_at': decision.get('created_at'),
+                    'weight': 1.0
+                })
+
+            # Get high-importance embeddings
+            high_importance = self.get_important_results('critical', limit=10)
+            for emb in high_importance:
+                inflection_points.append({
+                    'type': 'critical_embedding',
+                    'id': emb.get('id'),
+                    'content': emb.get('content', '')[:100],
+                    'created_at': emb.get('created_at'),
+                    'weight': 0.9
+                })
+
+            # Find causal chain starts (embeddings with outgoing but no incoming)
+            conn = sqlite3.connect(GRAPH_DB)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT DISTINCT r1.source_id
+                FROM relationships r1
+                WHERE r1.relationship_type = 'causal'
+                AND NOT EXISTS (
+                    SELECT 1 FROM relationships r2
+                    WHERE r2.target_id = r1.source_id
+                    AND r2.relationship_type = 'causal'
+                )
+                LIMIT 10
+            """)
+
+            for row in cursor.fetchall():
+                emb = self.get_embedding_by_id(row[0])
+                if emb:
+                    inflection_points.append({
+                        'type': 'causal_chain_start',
+                        'id': row[0],
+                        'content': emb.get('content', '')[:100],
+                        'weight': 0.8
+                    })
+
+            conn.close()
+
+            # Sort by weight and return
+            inflection_points.sort(key=lambda x: x.get('weight', 0), reverse=True)
+            return inflection_points
+
+        except Exception as e:
+            self._log(f"Error detecting inflection points: {e}")
+            return []
+
+    def compress_memory(
+        self, preserve_critical: bool = True,
+        preserve_decisions: bool = True,
+        max_embeddings: int = 1000
+    ) -> dict:
+        """
+        Compress memory while preserving critical information.
+
+        Strategy:
+        1. Always preserve: critical tier embeddings, decisions, invariants
+        2. Preserve: High-importance embeddings, causal chain nodes
+        3. Compress: Reference tier embeddings, old operations
+
+        Returns compression report with stats.
+        """
+        try:
+            conn = sqlite3.connect(VECTORS_DB)
+            cursor = conn.cursor()
+
+            # Count current embeddings
+            cursor.execute("SELECT COUNT(*) FROM embeddings")
+            total_before = cursor.fetchone()[0]
+
+            if total_before <= max_embeddings:
+                conn.close()
+                return {
+                    'status': 'no_compression_needed',
+                    'total_embeddings': total_before,
+                    'compressed': 0
+                }
+
+            # Identify embeddings to preserve
+            preserved_ids = set()
+
+            # 1. Always preserve critical tier
+            if preserve_critical:
+                cursor.execute("""
+                    SELECT id FROM embeddings
+                    WHERE importance_tier = 'critical'
+                """)
+                for row in cursor.fetchall():
+                    preserved_ids.add(row[0])
+
+            # 2. Preserve high importance
+            cursor.execute("""
+                SELECT id FROM embeddings
+                WHERE importance_tier = 'high'
+            """)
+            for row in cursor.fetchall():
+                preserved_ids.add(row[0])
+
+            # 3. Preserve causal chain participants
+            conn_graph = sqlite3.connect(GRAPH_DB)
+            cursor_graph = conn_graph.cursor()
+            cursor_graph.execute("""
+                SELECT DISTINCT source_id FROM relationships
+                WHERE relationship_type = 'causal'
+                UNION
+                SELECT DISTINCT target_id FROM relationships
+                WHERE relationship_type = 'causal'
+            """)
+            for row in cursor_graph.fetchall():
+                preserved_ids.add(row[0])
+            conn_graph.close()
+
+            # 4. Count what can be compressed
+            cursor.execute("""
+                SELECT id FROM embeddings
+                WHERE importance_tier IN ('reference', 'normal')
+                ORDER BY created_at ASC
+            """)
+            compressible = [row[0] for row in cursor.fetchall() if row[0] not in preserved_ids]
+
+            # Calculate how many to compress
+            target_count = max_embeddings
+            to_compress = max(0, total_before - target_count)
+            to_compress = min(to_compress, len(compressible))
+
+            # Perform soft-delete (mark as compressed, don't actually delete)
+            compressed_ids = compressible[:to_compress]
+            if compressed_ids:
+                # For now, downgrade to reference tier instead of deleting
+                placeholders = ','.join(['?' for _ in compressed_ids])
+                cursor.execute(f"""
+                    UPDATE embeddings
+                    SET importance_tier = 'reference'
+                    WHERE id IN ({placeholders})
+                    AND importance_tier = 'normal'
+                """, compressed_ids)
+                conn.commit()
+
+            conn.close()
+
+            return {
+                'status': 'compressed',
+                'total_before': total_before,
+                'total_after': total_before,  # Soft delete preserves count
+                'compressed_count': len(compressed_ids),
+                'preserved_count': len(preserved_ids),
+                'preserved_critical': preserve_critical,
+                'preserved_decisions': preserve_decisions
+            }
+
+        except Exception as e:
+            self._log(f"Error compressing memory: {e}")
+            return {'status': 'error', 'error': str(e)}
+
+    def generate_reconstruction_context(
+        self, task_hint: str = None, max_tokens: int = 2000
+    ) -> str:
+        """
+        Generate reconstruction context for post-compaction injection.
+
+        Creates a concise summary of:
+        1. Critical decisions and their rationale
+        2. Active invariants
+        3. Recent inflection points
+        4. Relevant context for current task
+
+        This context is injected after compaction to maintain continuity.
+        """
+        context_parts = []
+
+        # 1. Critical decisions
+        critical_decisions = self.get_decisions_by_tier('critical', limit=5)
+        if critical_decisions:
+            context_parts.append("## Critical Decisions")
+            for d in critical_decisions[:3]:
+                context_parts.append(f"- **{d.get('title', 'Untitled')}**: {d.get('rationale', '')[:100]}")
+
+        # 2. High-importance decisions
+        high_decisions = self.get_decisions_by_tier('high', limit=3)
+        if high_decisions:
+            context_parts.append("\n## Key Decisions")
+            for d in high_decisions:
+                context_parts.append(f"- {d.get('title', 'Untitled')}: {d.get('rationale', '')[:80]}")
+
+        # 3. Active invariants
+        try:
+            invariants = self.get_relevant_invariants()
+            if invariants:
+                context_parts.append("\n## Active Invariants")
+                for inv in invariants[:5]:
+                    context_parts.append(f"- [{inv.get('category', 'general')}] {inv.get('statement', '')[:100]}")
+        except:
+            pass
+
+        # 4. Task-relevant context (if hint provided)
+        if task_hint:
+            relevant = self.query_with_importance(task_hint, top_k=3, min_tier='high')
+            if relevant:
+                context_parts.append(f"\n## Relevant Context for: {task_hint[:50]}")
+                for r in relevant:
+                    context_parts.append(f"- {r.get('content', '')[:100]}...")
+
+        # 5. Recent inflection points
+        inflections = self.detect_inflection_points()
+        if inflections:
+            context_parts.append("\n## Key Moments")
+            for inf in inflections[:3]:
+                if inf['type'] == 'critical_decision':
+                    context_parts.append(f"- Decision: {inf.get('title', 'Unknown')}")
+                elif inf['type'] == 'causal_chain_start':
+                    context_parts.append(f"- Chain start: {inf.get('content', '')[:50]}...")
+
+        # Combine and truncate
+        context = '\n'.join(context_parts)
+
+        # Rough token estimation (4 chars per token)
+        max_chars = max_tokens * 4
+        if len(context) > max_chars:
+            context = context[:max_chars] + "\n\n[Context truncated]"
+
+        return context
+
+    def adaptive_retrieve(
+        self, query: str, context_type: str = 'general',
+        recency_weight: float = 0.3, importance_weight: float = 0.5
+    ) -> list:
+        """
+        Adaptive retrieval that adjusts based on context type.
+
+        Context types:
+        - 'general': Balanced retrieval
+        - 'debugging': Prioritize causal chains and error patterns
+        - 'architecture': Prioritize decisions and invariants
+        - 'implementation': Prioritize code and recent operations
+
+        Weights adjust the scoring formula:
+        score = base_similarity * (1 + recency_boost * recency_weight + importance_boost * importance_weight)
+        """
+        # Base semantic search
+        results = self.query_with_importance(query, top_k=20, min_tier='reference')
+
+        if not results:
+            return []
+
+        # Apply context-specific adjustments
+        adjusted_results = []
+
+        for result in results:
+            base_score = result.get('similarity', 0.5)
+            adjustments = 0
+
+            # Recency adjustment
+            created = result.get('created_at', '')
+            if created:
+                try:
+                    from datetime import datetime
+                    created_dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                    now = datetime.now(timezone.utc)
+                    hours_old = (now - created_dt).total_seconds() / 3600
+                    recency_boost = max(0, 1 - (hours_old / 168))  # Decay over 1 week
+                    adjustments += recency_boost * recency_weight
+                except:
+                    pass
+
+            # Importance adjustment
+            tier = result.get('importance_tier', 'normal')
+            tier_boosts = {'critical': 0.4, 'high': 0.2, 'normal': 0, 'reference': -0.1}
+            adjustments += tier_boosts.get(tier, 0) * importance_weight
+
+            # Context-specific boosts
+            if context_type == 'debugging':
+                # Boost causal chain members
+                if self._is_in_causal_chain(result.get('id', '')):
+                    adjustments += 0.2
+                # Boost error-related content
+                content = result.get('content', '').lower()
+                if any(kw in content for kw in ['error', 'bug', 'fix', 'issue', 'problem']):
+                    adjustments += 0.15
+
+            elif context_type == 'architecture':
+                # Boost decisions and invariants
+                source_type = result.get('source_type', '')
+                if source_type in ['decision', 'invariant']:
+                    adjustments += 0.3
+                content = result.get('content', '').lower()
+                if any(kw in content for kw in ['architecture', 'design', 'pattern', 'structure']):
+                    adjustments += 0.15
+
+            elif context_type == 'implementation':
+                # Boost code and operations
+                source_type = result.get('source_type', '')
+                if source_type == 'code':
+                    adjustments += 0.2
+                if source_type == 'operation':
+                    adjustments += 0.1
+
+            # Calculate final score
+            final_score = base_score * (1 + adjustments)
+            result['_adaptive_score'] = final_score
+            result['_adjustments'] = adjustments
+            adjusted_results.append(result)
+
+        # Sort by adaptive score
+        adjusted_results.sort(key=lambda x: x.get('_adaptive_score', 0), reverse=True)
+
+        return adjusted_results[:10]
+
+    def _is_in_causal_chain(self, embedding_id: str) -> bool:
+        """Check if embedding is part of a causal chain."""
+        if not embedding_id:
+            return False
+
+        try:
+            conn = sqlite3.connect(GRAPH_DB)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 1 FROM relationships
+                WHERE (source_id = ? OR target_id = ?)
+                AND relationship_type = 'causal'
+                LIMIT 1
+            """, (embedding_id, embedding_id))
+            result = cursor.fetchone() is not None
+            conn.close()
+            return result
+        except:
+            return False
+
+    def reweave_context(
+        self, current_task: str, session_history: list = None
+    ) -> dict:
+        """
+        Full CMR pipeline: detect, compress, reconstruct, retrieve.
+
+        This is the main entry point for Contextual Memory Reweaving.
+        Call this before/after compaction to maintain context continuity.
+
+        Returns:
+        - reconstruction_context: Text to inject post-compaction
+        - inflection_points: Key moments identified
+        - compression_report: What was compressed
+        - relevant_context: Task-specific retrieved context
+        """
+        # 1. Detect inflection points
+        inflection_points = self.detect_inflection_points()
+
+        # 2. Generate reconstruction context
+        reconstruction = self.generate_reconstruction_context(
+            task_hint=current_task,
+            max_tokens=1500
+        )
+
+        # 3. Adaptive retrieval for current task
+        relevant = self.adaptive_retrieve(
+            current_task,
+            context_type='general',
+            recency_weight=0.3,
+            importance_weight=0.5
+        )
+
+        # 4. Compression analysis (don't auto-compress, just report)
+        conn = sqlite3.connect(VECTORS_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM embeddings")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM embeddings WHERE importance_tier = 'critical'")
+        critical = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM embeddings WHERE importance_tier = 'high'")
+        high = cursor.fetchone()[0]
+        conn.close()
+
+        return {
+            'reconstruction_context': reconstruction,
+            'inflection_points': inflection_points[:5],
+            'relevant_context': [
+                {'id': r.get('id'), 'content': r.get('content', '')[:100], 'score': r.get('_adaptive_score', 0)}
+                for r in relevant[:5]
+            ],
+            'memory_stats': {
+                'total_embeddings': total,
+                'critical': critical,
+                'high': high,
+                'inflection_count': len(inflection_points)
+            }
         }
 
 
@@ -4313,6 +5681,22 @@ def main():
         print("  benchmark dmr            - Run Deep Memory Retrieval benchmark")
         print("  benchmark locomo         - Run LoCoMo-style benchmark")
         print("  benchmark all            - Run all benchmarks")
+        print("")
+        print("Phase 1 Commands (v1.8.0):")
+        print("  set-importance <id> <tier>   - Set importance tier (critical|high|normal|reference)")
+        print("  list-important <tier> [N]    - List embeddings by importance tier")
+        print("  query-important <text> [tier] - Query with importance weighting")
+        print("  store-decision <title> <rationale> [--tier T] [--type T]")
+        print("                               - Store architectural decision")
+        print("  get-decision <id>            - Retrieve decision by ID")
+        print("  list-decisions [--tier T] [--limit N]")
+        print("                               - List decisions by tier or recent")
+        print("  store-invariant <category> <statement> [--enforcement E]")
+        print("                               - Store architectural invariant")
+        print("  list-invariants [--category C]  - List invariants by category")
+        print("  link-causal <src> <tgt> [reason] - Create causal relationship")
+        print("  trace-causality <id> [depth]    - Trace causal chain from embedding")
+        print("  get-related <id>               - Get causally related embeddings")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -5183,6 +6567,475 @@ def main():
                 except Exception as e:
                     print(f"Error reading {os.path.basename(primer_path)}: {e}")
                     print("-" * 50)
+
+        # =========================================================
+        # PHASE 1: Importance, Decisions, Invariants, Causality (v1.8.0)
+        # =========================================================
+
+        elif command == "set-importance":
+            # Set importance tier for an embedding
+            if len(sys.argv) < 4:
+                print("Usage: cam_core.py set-importance <embedding_id> <tier>")
+                print("  tier: critical | high | normal | reference")
+                sys.exit(1)
+
+            embedding_id = sys.argv[2]
+            tier = sys.argv[3]
+
+            if cam.set_importance_tier(embedding_id, tier):
+                print(f"[v] Set importance tier for {embedding_id} to {tier}")
+            else:
+                print(f"[!] Failed to set importance tier")
+                sys.exit(1)
+
+        elif command == "list-important":
+            # List embeddings by importance tier
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py list-important <tier> [limit]")
+                print("  tier: critical | high | normal | reference")
+                sys.exit(1)
+
+            tier = sys.argv[2]
+            limit = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+
+            results = cam.get_important_results(tier, limit)
+
+            if results:
+                print(f"Embeddings with importance tier '{tier}':")
+                for r in results:
+                    print(f"\n  [{r['id']}] ({r['source_type']})")
+                    print(f"    {r['content'][:150]}...")
+                    print(f"    Created: {r['created_at']}")
+            else:
+                print(f"No embeddings found with tier '{tier}'")
+
+        elif command == "query-important":
+            # Query with importance weighting
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py query-important <text> [min_tier] [top_k]")
+                print("  min_tier: critical | high | normal | reference (default: normal)")
+                sys.exit(1)
+
+            query_text = sys.argv[2]
+            min_tier = sys.argv[3] if len(sys.argv) > 3 else 'normal'
+            top_k = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+
+            results = cam.query_with_importance(query_text, top_k, min_tier)
+
+            for i, r in enumerate(results, 1):
+                print(f"\n{i}. [Score: {r['score']:.4f}] {r['id']}")
+                print(f"   Tier: {r['importance_tier']} (multiplier: {r['importance_multiplier']}x)")
+                print(f"   {r['content'][:200]}...")
+
+        elif command == "store-decision":
+            # Store architectural decision
+            if len(sys.argv) < 4:
+                print("Usage: cam_core.py store-decision <title> <rationale> [--tier T] [--type T]")
+                print("  --tier: critical | high | normal | reference (default: normal)")
+                print("  --type: architecture | technical | process")
+                sys.exit(1)
+
+            title = sys.argv[2]
+            rationale = sys.argv[3]
+            tier = 'normal'
+            decision_type = None
+
+            # Parse optional args
+            i = 4
+            while i < len(sys.argv):
+                if sys.argv[i] == "--tier" and i + 1 < len(sys.argv):
+                    tier = sys.argv[i + 1]
+                    i += 2
+                elif sys.argv[i] == "--type" and i + 1 < len(sys.argv):
+                    decision_type = sys.argv[i + 1]
+                    i += 2
+                else:
+                    i += 1
+
+            decision_id = cam.store_decision(
+                title=title,
+                rationale=rationale,
+                importance_tier=tier,
+                decision_type=decision_type
+            )
+
+            if decision_id:
+                print(f"[v] Decision stored: {decision_id}")
+                print(f"    Title: {title}")
+                print(f"    Tier: {tier}")
+            else:
+                print("[!] Failed to store decision")
+                sys.exit(1)
+
+        elif command == "get-decision":
+            # Retrieve decision by ID
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py get-decision <decision_id>")
+                sys.exit(1)
+
+            decision_id = sys.argv[2]
+            decision = cam.retrieve_decision(decision_id)
+
+            if decision:
+                print(json.dumps(decision, indent=2))
+            else:
+                print(f"[!] Decision not found: {decision_id}")
+                sys.exit(1)
+
+        elif command == "list-decisions":
+            # List decisions by tier or recent
+            tier = None
+            limit = 10
+
+            # Parse args
+            i = 2
+            while i < len(sys.argv):
+                if sys.argv[i] == "--tier" and i + 1 < len(sys.argv):
+                    tier = sys.argv[i + 1]
+                    i += 2
+                elif sys.argv[i] == "--limit" and i + 1 < len(sys.argv):
+                    limit = int(sys.argv[i + 1])
+                    i += 2
+                else:
+                    i += 1
+
+            if tier:
+                results = cam.get_decisions_by_tier(tier, limit)
+                print(f"Decisions with tier '{tier}':")
+            else:
+                results = cam.get_recent_decisions(limit)
+                print(f"Recent decisions:")
+
+            for r in results:
+                print(f"\n  [{r['id']}] {r['title']}")
+                print(f"    Tier: {r['importance_tier']} | Created: {r['created_at']}")
+                if 'rationale' in r:
+                    print(f"    {r['rationale'][:100]}...")
+
+        elif command == "store-invariant":
+            # Store architectural invariant
+            if len(sys.argv) < 4:
+                print("Usage: cam_core.py store-invariant <category> <statement> [--enforcement E] [--rationale R]")
+                print("  category: security | performance | architecture | business")
+                print("  --enforcement: required | preferred | guideline (default: required)")
+                sys.exit(1)
+
+            category = sys.argv[2]
+            statement = sys.argv[3]
+            enforcement = 'required'
+            rationale = None
+
+            # Parse optional args
+            i = 4
+            while i < len(sys.argv):
+                if sys.argv[i] == "--enforcement" and i + 1 < len(sys.argv):
+                    enforcement = sys.argv[i + 1]
+                    i += 2
+                elif sys.argv[i] == "--rationale" and i + 1 < len(sys.argv):
+                    rationale = sys.argv[i + 1]
+                    i += 2
+                else:
+                    i += 1
+
+            invariant_id = cam.store_invariant(
+                category=category,
+                statement=statement,
+                rationale=rationale,
+                enforcement=enforcement
+            )
+
+            if invariant_id:
+                print(f"[v] Invariant stored: {invariant_id}")
+                print(f"    Category: {category}")
+                print(f"    Enforcement: {enforcement}")
+            else:
+                print("[!] Failed to store invariant")
+                sys.exit(1)
+
+        elif command == "list-invariants":
+            # List invariants by category
+            category = None
+
+            # Parse args
+            i = 2
+            while i < len(sys.argv):
+                if sys.argv[i] == "--category" and i + 1 < len(sys.argv):
+                    category = sys.argv[i + 1]
+                    i += 2
+                else:
+                    i += 1
+
+            if category:
+                results = cam.get_invariants_by_category(category)
+                print(f"Invariants in category '{category}':")
+            else:
+                results = cam.get_relevant_invariants()
+                print("Required invariants (all categories):")
+
+            for r in results:
+                print(f"\n  [{r['id']}] {r.get('category', 'N/A')}")
+                print(f"    {r['statement']}")
+                print(f"    Enforcement: {r['enforcement']}")
+
+        elif command == "link-causal":
+            # Create causal relationship
+            if len(sys.argv) < 4:
+                print("Usage: cam_core.py link-causal <source_id> <target_id> [reason]")
+                sys.exit(1)
+
+            source_id = sys.argv[2]
+            target_id = sys.argv[3]
+            reason = sys.argv[4] if len(sys.argv) > 4 else None
+
+            if cam.create_causal_relationship(source_id, target_id, reason):
+                print(f"[v] Causal link created: {source_id[:8]} → {target_id[:8]}")
+                if reason:
+                    print(f"    Reason: {reason}")
+            else:
+                print("[!] Failed to create causal link")
+                sys.exit(1)
+
+        elif command == "trace-causality":
+            # Trace causal chain from embedding
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py trace-causality <embedding_id> [max_depth]")
+                sys.exit(1)
+
+            embedding_id = sys.argv[2]
+            max_depth = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+
+            result = cam.trace_causality(embedding_id, max_depth)
+            print(json.dumps(result, indent=2))
+
+        elif command == "get-related":
+            # Get causally related embeddings
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py get-related <embedding_id>")
+                sys.exit(1)
+
+            embedding_id = sys.argv[2]
+            results = cam.get_causal_related(embedding_id)
+
+            if results:
+                print(f"Embeddings related to {embedding_id}:")
+                for r in results:
+                    print(f"\n  [{r['id']}] ({r['relationship']})")
+                    print(f"    {r['content']}...")
+            else:
+                print(f"No related embeddings found for {embedding_id}")
+
+        # =====================================================================
+        # PHASE 3: Query DSL Commands (v2.0.0)
+        # =====================================================================
+
+        elif command == "query-dsl":
+            # Execute Query DSL
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py query-dsl '<dsl_string>'")
+                print("\nExample DSL:")
+                print('[query]')
+                print('text = "authentication"')
+                print('min_tier = "high"')
+                print('top_k = 5')
+                print('')
+                print('[constraints]')
+                print('type = "code"')
+                print('')
+                print('[graph]')
+                print('traverse = true')
+                print('max_depth = 2')
+                sys.exit(1)
+
+            dsl_input = sys.argv[2]
+            results = cam.query_dsl(dsl_input)
+
+            if results:
+                print(f"Query DSL Results ({len(results)} matches):\n")
+                for i, r in enumerate(results, 1):
+                    graph_info = ""
+                    if r.get('_graph_source'):
+                        graph_info = f" [via graph: {r['_graph_source'][:8]}]"
+                    print(f"{i}. [{r.get('id', 'N/A')[:8]}] {r.get('importance_tier', 'normal')}{graph_info}")
+                    content = r.get('content', '')[:150]
+                    print(f"   {content}...")
+                    print()
+            else:
+                print("No results found")
+
+        elif command == "query-graph":
+            # Query with graph expansion
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py query-graph '<text>' [top_k] [max_depth]")
+                sys.exit(1)
+
+            text = sys.argv[2]
+            top_k = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+            max_depth = int(sys.argv[4]) if len(sys.argv) > 4 else 2
+
+            results = cam.query_with_graph(text, top_k=top_k, max_depth=max_depth)
+
+            if results:
+                print(f"Graph-Enhanced Query Results ({len(results)} matches):\n")
+                for i, r in enumerate(results, 1):
+                    source_info = ""
+                    if r.get('_graph_source'):
+                        source_info = f" [graph-linked from {r['_graph_source'][:8]}]"
+                    print(f"{i}. [{r.get('id', 'N/A')[:8]}]{source_info}")
+                    content = r.get('content', '')[:150]
+                    print(f"   {content}...")
+                    print()
+            else:
+                print("No results found")
+
+        elif command == "multi-hop":
+            # Multi-hop reasoning query
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py multi-hop '<question1>' '<question2>' ... [--strategy chain|parallel]")
+                sys.exit(1)
+
+            # Parse questions and strategy
+            questions = []
+            strategy = 'chain'
+            i = 2
+            while i < len(sys.argv):
+                if sys.argv[i] == '--strategy' and i + 1 < len(sys.argv):
+                    strategy = sys.argv[i + 1]
+                    i += 2
+                else:
+                    questions.append(sys.argv[i])
+                    i += 1
+
+            if not questions:
+                print("Error: At least one question required")
+                sys.exit(1)
+
+            result = cam.multi_hop_query(questions, strategy=strategy)
+
+            print(f"Multi-Hop Query ({strategy} strategy, {result['total_hops']} hops):\n")
+
+            print("Reasoning Chain:")
+            for hop in result['chain']:
+                print(f"  Hop {hop['hop']}: {hop['question'][:50]}...")
+                print(f"    -> {hop['results_count']} results")
+                if hop.get('top_result'):
+                    print(f"    -> Top: {hop['top_result'][:80]}...")
+            print()
+
+            print(f"Combined Results ({len(result['results'])} unique):")
+            for i, r in enumerate(result['results'][:10], 1):
+                print(f"  {i}. [{r.get('id', 'N/A')[:8]}] {r.get('content', '')[:100]}...")
+
+        elif command == "get-embedding":
+            # Get single embedding by ID
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py get-embedding <embedding_id>")
+                sys.exit(1)
+
+            embedding_id = sys.argv[2]
+            result = cam.get_embedding_by_id(embedding_id)
+
+            if result:
+                print(json.dumps(result, indent=2, default=str))
+            else:
+                print(f"Embedding not found: {embedding_id}")
+
+        # =====================================================================
+        # PHASE 4: CMR Commands (v2.1.0)
+        # =====================================================================
+
+        elif command == "inflection-points":
+            # Detect inflection points
+            results = cam.detect_inflection_points()
+
+            if results:
+                print(f"Inflection Points ({len(results)} detected):\n")
+                for i, r in enumerate(results, 1):
+                    print(f"{i}. [{r['type']}] (weight: {r.get('weight', 0):.2f})")
+                    if r.get('title'):
+                        print(f"   Title: {r['title']}")
+                    if r.get('content'):
+                        print(f"   Content: {r['content'][:80]}...")
+                    print()
+            else:
+                print("No inflection points detected")
+
+        elif command == "compress-memory":
+            # Compress memory with preservation
+            max_embeddings = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
+
+            print(f"Compressing memory (target: {max_embeddings} embeddings)...")
+            result = cam.compress_memory(max_embeddings=max_embeddings)
+
+            print(json.dumps(result, indent=2))
+
+        elif command == "reconstruction-context":
+            # Generate reconstruction context
+            task_hint = sys.argv[2] if len(sys.argv) > 2 else None
+            max_tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 2000
+
+            context = cam.generate_reconstruction_context(
+                task_hint=task_hint,
+                max_tokens=max_tokens
+            )
+
+            print("=== RECONSTRUCTION CONTEXT ===\n")
+            print(context)
+
+        elif command == "adaptive-retrieve":
+            # Adaptive retrieval
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py adaptive-retrieve '<query>' [context_type]")
+                print("Context types: general, debugging, architecture, implementation")
+                sys.exit(1)
+
+            query = sys.argv[2]
+            context_type = sys.argv[3] if len(sys.argv) > 3 else 'general'
+
+            results = cam.adaptive_retrieve(query, context_type=context_type)
+
+            if results:
+                print(f"Adaptive Retrieval ({context_type} context):\n")
+                for i, r in enumerate(results, 1):
+                    score = r.get('_adaptive_score', 0)
+                    adj = r.get('_adjustments', 0)
+                    print(f"{i}. [{r.get('id', 'N/A')[:8]}] score: {score:.3f} (adj: {adj:+.3f})")
+                    print(f"   {r.get('content', '')[:100]}...")
+                    print()
+            else:
+                print("No results found")
+
+        elif command == "reweave":
+            # Full CMR pipeline
+            if len(sys.argv) < 3:
+                print("Usage: cam_core.py reweave '<current_task>'")
+                sys.exit(1)
+
+            current_task = sys.argv[2]
+            result = cam.reweave_context(current_task)
+
+            print("=== CMR: CONTEXTUAL MEMORY REWEAVING ===\n")
+
+            print("## Memory Stats")
+            stats = result['memory_stats']
+            print(f"  Total embeddings: {stats['total_embeddings']}")
+            print(f"  Critical: {stats['critical']}")
+            print(f"  High: {stats['high']}")
+            print(f"  Inflection points: {stats['inflection_count']}")
+            print()
+
+            print("## Inflection Points")
+            for inf in result['inflection_points']:
+                print(f"  - [{inf['type']}] {inf.get('title', inf.get('content', '')[:50])}")
+            print()
+
+            print("## Relevant Context")
+            for ctx in result['relevant_context']:
+                print(f"  - [{ctx['id'][:8]}] (score: {ctx['score']:.3f}) {ctx['content'][:60]}...")
+            print()
+
+            print("## Reconstruction Context")
+            print("-" * 40)
+            print(result['reconstruction_context'])
 
         else:
             print(f"Unknown command: {command}")

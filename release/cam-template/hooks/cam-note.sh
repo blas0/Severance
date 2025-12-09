@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # cam-note.sh - Store ephemeral notes in CAM without creating files
+# Version: 2.0.0
 # Usage: cam-note.sh "Title" "Content" ["tag1,tag2,tag3"]
 
 set -euo pipefail

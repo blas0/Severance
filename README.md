@@ -18,7 +18,7 @@ Continuous Architectural Memory
 
 <div align="center">
     
-![N](https://img.shields.io/badge/CAM-v1.7.2-ffd745?logo=python)
+![N](https://img.shields.io/badge/CAM-v2.0.0-ffd745?logo=python)
 
 </div>
 
@@ -33,6 +33,17 @@ CAM gives specifically Claude, persistent memory across sessions by:
 - **Semantic Search**: Query past context by intent, not just keywords
 - **Knowledge Graphs**: Building relationships between concepts over time
 - **Automatic Hooks**: Claude Code integration for hands-free memory updates
+
+### v2.0 Features
+
+| Category | Features |
+|----------|----------|
+| **Intelligence Layer** | Importance tiers (critical/high/normal/reference), Decision store, Invariant management, Causal tracking |
+| **Query DSL** | TOML queries, Graph expansion, Multi-hop reasoning |
+| **Memory Management** | Inflection detection, Smart compression, Reconstruction context, Adaptive retrieval |
+| **PR Workflow** | Session PRs instead of auto-commits, Conventional Commits |
+
+See [CHANGELOG.md](CHANGELOG.md) for full details and [COMMANDS.md](COMMANDS.md) for CLI reference.
 
 ### Two Sources of Truth
 
@@ -150,6 +161,14 @@ When tailoring CAM for your own use case, edit files within:
 ```
 
 This will update the projects (.claude/cam) CAM interface accordingly: `cam_core.py` `cam.sh`
+
+### <ins>Auto-Migration (v2.0+)</ins>
+
+Existing CAM databases automatically upgrade on first v2.0 run:
+- Adds `importance_tier` column to embeddings table
+- Creates `decisions` and `invariants` tables
+- Existing data preserved with default values
+- No manual migration required
 
 ### <ins>Project Structure</ins>
 

@@ -1,5 +1,6 @@
 #!/bin/bash
-  # Global PreToolUse Hook: Smart decision-point CAM queries with caching
+# Global PreToolUse Hook: Smart decision-point CAM queries with caching
+# Version: 2.0.0
 
 set -e
 

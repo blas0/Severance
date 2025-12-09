@@ -1,6 +1,6 @@
 #!/bin/bash
 # Global PostToolUse Hook: Annotate operations to CAM
-# v1.5.0: Added automatic file ingestion for Edit/Write operations (Phase 5)
+# Version: 2.0.0
 
 set -e
 

@@ -107,6 +107,48 @@ Claude automatically consults CAM at decision points through hooks:
 - Skips large files (>100KB), lock files, and node_modules
 - Keeps CAM's semantic index synchronized with codebase changes
 
+### Advanced Features (v2.0+)
+
+Phase 3 (Query DSL) and Phase 4 (CMR) are power-user features NOT automated in hooks. Use them proactively:
+
+**Query DSL (When complex search is needed):**
+```bash
+# Structured TOML query with constraints
+./.claude/cam/cam.sh query-dsl '[query]
+text = "authentication"
+min_tier = "high"
+[constraints]
+type = "code"'
+
+# Query with graph expansion
+./.claude/cam/cam.sh query-graph "error handling" 5 2
+
+# Multi-hop reasoning
+./.claude/cam/cam.sh multi-hop "what caused bug" "how was it fixed" --strategy chain
+```
+
+**CMR - Contextual Memory Reweaving (When context is large or after compaction):**
+```bash
+# Detect important inflection points
+./.claude/cam/cam.sh inflection-points
+
+# Generate reconstruction context after /compact
+./.claude/cam/cam.sh reconstruction-context "current task" 2000
+
+# Context-aware retrieval
+./.claude/cam/cam.sh adaptive-retrieve "debugging auth" debugging
+
+# Full CMR pipeline (combines all above)
+./.claude/cam/cam.sh reweave "implementing feature X"
+```
+
+**When to Use:**
+- `query-dsl`: Complex searches needing filters, constraints, or graph traversal
+- `query-graph`: When related context matters (follow relationships)
+- `multi-hop`: Multi-step questions ("what caused X then how was Y fixed")
+- `reweave`: After compaction or when context seems disconnected
+- `adaptive-retrieve`: Debugging (prioritizes recent/causal) vs architecture (prioritizes decisions)
+
 ### Proactive CAM Usage (Manual Consultation)
 
 In addition to automatic hooks, Claude can proactively consult CAM during reasoning:
@@ -158,35 +200,40 @@ Session context cache: `~/.claude/.session-cam-context`
 
 ### Changelog
 
-Before modifying CAM infrastructure, append changes to `~/.claude/cam-template/CHANGELOG.md`:
+Before modifying CAM infrastructure, append changes to project root `CHANGELOG.md`:
 - `~/.claude/CLAUDE.md` (protocol)
 - `~/.claude/hooks/*.sh` (hooks)
 - `~/.claude/cam-template/cam_core.py` / `~/.claude/cam-template/cam.sh` (core)
 - `~/.claude/cam-template/settings-hooks.json` (hooks settings)
 
-### Version Management
+**Location**: `/CHANGELOG.md` (project root, not cam-template)
 
-**When modifying `~/.claude/cam-template/`**, increment `VERSION.txt` proactively:
+### Version Management (v2.0+)
 
-1. Determine change type per [VERSIONING.md](~/.claude/cam-template/VERSIONING.md):
-   - Bug fix / improvement → Increment patch (e.g., 1.2.6 → 1.2.7)
-   - New feature / phase → Increment minor (e.g., 1.2.9 → 1.3.1)
-   - Breaking change → Increment major
+**Simple Rule: Any code change = patch increment.**
 
-2. Update these files in `~/.claude/cam-template/`:
-   - `VERSION.txt` - Plain version number
-   - `cam_core.py` - `CAM_VERSION` variable (line 22)
-   - `CHANGELOG.md` - New `[x.y.z]` entry at top
+```
+2.0.0 → 2.0.1 → 2.0.2 → 2.0.3 → ...
+```
 
-3. After editing template, deploy changes:
+**When modifying any CAM code** (hooks, cam_core.py, cam.sh):
+
+1. Increment patch version (e.g., 2.0.0 → 2.0.1)
+
+2. Update ALL of these files:
+   - `~/.claude/cam-template/VERSION.txt`
+   - `/release/cam-template/VERSION.txt`
+   - `cam_core.py` line 26: `CAM_VERSION = "x.y.z"`
+   - Modified hook(s): `# Version: x.y.z` header
+
+3. Deploy changes:
    ```bash
    ~/.claude/hooks/cam-sync-template.sh
    ```
 
-4. Projects pull updates via:
-   ```bash
-   ./cam.sh upgrade
-   ```
+**Does NOT require version bump**: README.md, CHANGELOG.md, documentation-only changes.
+
+See [VERSIONING.md](~/.claude/cam-template/VERSIONING.md) for full policy.
 
 ### Documentation
 

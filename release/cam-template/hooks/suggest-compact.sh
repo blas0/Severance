@@ -1,7 +1,7 @@
 #!/bin/bash
 # ~/.claude/hooks/suggest-compact.sh
 # Stop Hook: Suggest /compact when context grows large
-# Version: 1.7.0 (Phase 6)
+# Version: 2.0.0
 #
 # Fires: On Stop event (end of assistant turn)
 # Purpose: Proactively suggest compaction before auto-compact triggers

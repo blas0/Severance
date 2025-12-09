@@ -1,10 +1,9 @@
 #!/bin/bash
 # cam-sync-template.sh - Deploy CAM template to live locations
-# Run this after making changes to files in ~/.claude/cam-template/
+# Version: 2.0.0
 # Usage: cam-sync-template.sh [--hooks-only | --settings-only | --all]
 #
 # DIRECTION: ~/.claude/cam-template/ → ~/.claude/hooks/ & settings.json
-# (Inverted in v1.2.7: template is now the source of truth)
 
 set -e
 

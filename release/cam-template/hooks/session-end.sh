@@ -1,6 +1,6 @@
 #!/bin/bash
 # Global SessionEnd Hook: Intelligent Session Summary Generation
-# Version: 1.7.0 (Phase 6 - Session state cleanup + structured summaries)
+# Version: 2.0.0
 
 set -e
 

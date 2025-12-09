@@ -1,7 +1,7 @@
 #!/bin/bash
 # Global PostCAMQuery Hook: Annotate CAM semantic queries
-#
-# Status: DORMANT (Phase 2 - Future Implementation)
+# Version: 2.0.0
+# Status: DORMANT (Future Implementation)
 #
 # This hook will annotate CAM semantic query operations once the
 # PostCAMQuery hook system is integrated into Claude Code.

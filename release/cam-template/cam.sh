@@ -277,7 +277,13 @@ case "$1" in
         "$VENV_PYTHON" "$CAM_CORE" get "$2"
         ;;
 
-    stats|query|ingest|annotate|eval|benchmark|graph|rebuild|relate|find-doc)
+    stats|query|ingest|annotate|eval|benchmark|graph|rebuild|relate|find-doc|\
+    set-importance|list-important|query-important|\
+    store-decision|get-decision|list-decisions|\
+    store-invariant|list-invariants|\
+    link-causal|trace-causality|get-related|\
+    query-dsl|query-graph|multi-hop|get-embedding|\
+    inflection-points|compress-memory|reconstruction-context|adaptive-retrieve|reweave)
         # Check venv for Python commands
         check_venv
         check_dependencies
