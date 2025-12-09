@@ -23,7 +23,7 @@ from scipy.cluster.hierarchy import fcluster, linkage
 from scipy.spatial.distance import cosine as cosine_distance
 
 # Version
-CAM_VERSION = "2.0.1"
+CAM_VERSION = "2.0.2"
 
 # Configuration
 CAM_DIR = os.path.join(os.path.dirname(__file__))
@@ -2325,7 +2325,7 @@ Original Prompt:
             cursor = conn.cursor()
 
             cursor.execute("""
-                SELECT id, content, source_type, source_path, created_at,
+                SELECT id, content, source_type, source_file, created_at,
                        importance_tier
                 FROM embeddings
                 WHERE id = ?
